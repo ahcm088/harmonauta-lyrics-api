@@ -99,58 +99,67 @@ def get_lyrics():
         session.headers.update({'User-Agent': USER_AGENTS[0]})
         
         artist_slug = sanitize_slug(artist)
-        
-        # Tentar diferentes variações da URL do artista
-        artist_urls = [
-            f"https://www.letras.com/{artist_slug}/",
-            f"https://www.letras.com/{artist_slug}-mc/",
-            f"https://www.letras.com/{artist_slug}-banda/",
-            f"https://www.letras.com/{artist_slug}-musica/",
-        ]
 
-        response = None
-        for url in artist_urls:
-            try:
-                response = session.get(url)
-                if response.status_code == 200:
-                    break
-            except requests.exceptions.SSLError as e:
-                app.logger.warning(f"SSL Error for {url}: {str(e)}")
-                continue
-            except requests.RequestException:
-                continue
+        # letras.com passou a bloquear scraping (retorna 403 Access Denied
+        # mesmo com User-Agent de navegador). letras.com.br é um domínio
+        # diferente (empresa diferente) que responde normalmente.
+        artist_url = f"https://www.letras.com.br/{artist_slug}/"
+
+        try:
+            response = session.get(artist_url)
+        except requests.exceptions.SSLError as e:
+            app.logger.warning(f"SSL Error for {artist_url}: {str(e)}")
+            response = None
+        except requests.RequestException:
+            response = None
 
         if not response or response.status_code != 200:
             return jsonify({
                 'success': False,
-                'message': 'Artista não encontrado no letras.com'
+                'message': 'Artista não encontrado no letras.com.br'
             }), 404
 
+        # No letras.com.br as músicas do artista aparecem como links
+        # <a href="https://www.letras.com.br/{artista}/{slug-da-musica}">
+        # direto no HTML (sem atributo title, diferente do letras.com).
         soup = BeautifulSoup(response.text, "html.parser")
-        song_links = soup.find_all("a", title=True)
+        song_link_pattern = re.compile(
+            rf"^https://www\.letras\.com\.br/{re.escape(artist_slug)}/([a-z0-9-]+)$"
+        )
+        non_song_slugs = {"discografia", "biografia", "curiosidades", "contribuicao", "traducao"}
 
-        # Compara títulos por similaridade
+        song_slugs = set()
+        for link in soup.find_all("a", href=True):
+            href = link["href"].split("#")[0].rstrip("/")
+            match = song_link_pattern.match(href)
+            if match and match.group(1) not in non_song_slugs:
+                song_slugs.add(match.group(1))
+
+        if not song_slugs:
+            return jsonify({
+                'success': False,
+                'message': 'Nenhuma música encontrada para esse artista'
+            }), 404
+
+        # Compara o título pedido com os slugs disponíveis por similaridade
         def similarity(a, b):
             return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-        best_match = None
-        best_score = 0.0
+        title_slug = sanitize_slug(title)
+        best_slug, best_score = None, 0.0
 
-        for link in song_links:
-            candidate = link.get("title")
-            if candidate:
-                score = similarity(title, candidate)
-                if score > best_score:
-                    best_score = score
-                    best_match = link
+        for slug in song_slugs:
+            score = similarity(title_slug, slug)
+            if score > best_score:
+                best_score, best_slug = score, slug
 
-        if not best_match or best_score < 0.6:
+        if not best_slug or best_score < 0.6:
             return jsonify({
                 'success': False,
                 'message': 'Música não encontrada ou muito diferente do título fornecido'
             }), 404
 
-        lyrics_url = "https://www.letras.com" + best_match["href"]
+        lyrics_url = f"https://www.letras.com.br/{artist_slug}/{best_slug}"
         lyrics_response = session.get(lyrics_url)
 
         if lyrics_response.status_code != 200:
@@ -159,16 +168,20 @@ def get_lyrics():
                 'message': 'Erro ao acessar a página da música'
             }), 500
 
+        # A letra fica em <section class="lyrics-section"><p>...<br>...</p></section>
         lyrics_soup = BeautifulSoup(lyrics_response.text, "html.parser")
-        lyrics_div = lyrics_soup.find("div", class_="lyric-original")
+        lyrics_section = lyrics_soup.find("section", class_="lyrics-section")
 
-        if not lyrics_div:
+        if not lyrics_section:
             return jsonify({
                 'success': False,
                 'message': 'Letra não encontrada'
             }), 404
 
-        lyrics = clean_lyrics(lyrics_div.get_text(separator="\n", strip=True))
+        for br in lyrics_section.find_all("br"):
+            br.replace_with("\n")
+
+        lyrics = clean_lyrics(lyrics_section.get_text())
 
         if not lyrics.strip():
             return jsonify({
@@ -179,9 +192,9 @@ def get_lyrics():
         return jsonify({
             'success': True,
             'lyrics': lyrics,
-            'title': best_match.get('title'),
+            'title': best_slug.replace('-', ' ').title(),
             'artist': artist,
-            'similarity_score': best_score,
+            'similarity_score': round(best_score, 2),
             'message': 'Letra encontrada com sucesso'
         })
 
@@ -209,4 +222,3 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-    
